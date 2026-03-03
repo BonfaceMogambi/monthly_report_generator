@@ -249,12 +249,6 @@ class DatabaseManager:
         finally:
             cursor.close()
             conn.close()
-    def get_document_content(self, doc_id: int) -> Optional[bytes]:
-        """Get document content by ID - Note: This requires storing content in database or file system"""
-        # Since we're not storing the actual content in the database,
-        # we need to retrieve it from session state or file system
-        # For now, we'll rely on session state
-        return None
 
     # ------------------------------------------------------------------
     # User management
@@ -397,63 +391,40 @@ class DatabaseManager:
     # ------------------------------------------------------------------
     # Document management
     # ------------------------------------------------------------------
-    def save_document(self, filename: str, content: bytes, uploaded_by: str, record_count: int = None) -> Optional[int]:
-        """Save document metadata to database. Returns document ID if successful, None if failed."""
-        conn = None
-        cursor = None
+    def save_document(self, filename: str, content: bytes, uploaded_by: str, record_count: int = None) -> bool:
+        """Save document metadata to database"""
+        conn = self.get_connection()
+        if not conn:
+            return False
         
         try:
-            conn = self.get_connection()
-            if not conn:
-                return None
-            
             cursor = conn.cursor()
             
             # Get user ID
             cursor.execute("SELECT id FROM users WHERE username = %s", (uploaded_by,))
             user_result = cursor.fetchone()
             if not user_result:
-                return None
+                return False
             user_id = user_result[0]
             
             # Calculate file hash for uniqueness
             file_hash = hashlib.sha256(content).hexdigest()
             
-            # Check if document with same hash already exists
-            cursor.execute("SELECT id FROM uploaded_documents WHERE file_hash = %s", (file_hash,))
-            existing = cursor.fetchone()
-            if existing:
-                doc_id = existing[0]
-                return doc_id  # Return existing document ID
-            
-            # Insert new document record
+            # Insert document record
             cursor.execute("""
                 INSERT INTO uploaded_documents (filename, file_hash, uploaded_by, record_count)
                 VALUES (%s, %s, %s, %s)
             """, (filename, file_hash, user_id, record_count))
             
             conn.commit()
-            doc_id = cursor.lastrowid
-            return doc_id  # Return new document ID
+            return True
             
         except Error as e:
             st.error(f"Error saving document: {e}")
-            if conn:
-                conn.rollback()
-            return None
-            
+            return False
         finally:
-            # Always close cursor and connection in the correct order
-            if cursor:
-                try:
-                    cursor.close()
-                except:
-                    pass
-            if conn:
-                try:
-                    conn.close()
-                except:
-                    pass
+            cursor.close()
+            conn.close()
 
     def get_all_documents(self) -> List[Dict]:
         """Get all uploaded documents from database"""
@@ -686,15 +657,11 @@ class VisualizationEngine:
             ))
         fig.update_layout(
             title=dict(text=f'{sacco_name} - Daily Performance ({sacco_data["APPROVAL RATE"].mean():.2f}%)',
-                    font=dict(size=20, color=VisualizationEngine.COLOR_PALETTE['primary'])),
+                       font=dict(size=20, color=VisualizationEngine.COLOR_PALETTE['primary'])),
             xaxis=dict(title='Date', tickangle=-45),
             yaxis=dict(title='Approval Rate (%)', range=[0, 105], gridcolor='lightgray', griddash='dot'),
             yaxis2=dict(title='Transaction Count', overlaying='y', side='right', showgrid=False),
-            hovermode='x unified', 
-            height=400, 
-            template='plotly_white',
-            plot_bgcolor='rgba(0,0,0,0)',  # Transparent plot area
-            paper_bgcolor='rgba(0,0,0,0)',  # Transparent paper
+            hovermode='x unified', height=400, template='plotly_white',
             legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
             margin=dict(l=60, r=60, t=80, b=60),
         )
@@ -734,12 +701,8 @@ class VisualizationEngine:
             ))
             fig.update_layout(
                 title=dict(text=f'{sacco_name} - Error Distribution', x=0.1,
-                        font=dict(size=20, color=VisualizationEngine.COLOR_PALETTE['primary'])),
-                height=400, 
-                template='plotly_white',
-                plot_bgcolor='rgba(0,0,0,0)',  # Transparent plot area
-                paper_bgcolor='rgba(0,0,0,0)',  # Transparent paper
-                showlegend=True,
+                          font=dict(size=20, color=VisualizationEngine.COLOR_PALETTE['primary'])),
+                height=400, template='plotly_white', showlegend=True,
                 legend=dict(
                     orientation='v',
                     x=0.60, y=0.5,
@@ -757,11 +720,8 @@ class VisualizationEngine:
             )
             fig.update_layout(
                 title=dict(text=f'{sacco_name} - Error Distribution', x=0.5,
-                        font=dict(size=20, color=VisualizationEngine.COLOR_PALETTE['primary'])),
-                height=400, 
-                template='plotly_white',
-                plot_bgcolor='rgba(0,0,0,0)',  # Transparent plot area
-                paper_bgcolor='rgba(0,0,0,0)',  # Transparent paper
+                          font=dict(size=20, color=VisualizationEngine.COLOR_PALETTE['primary'])),
+                height=400, template='plotly_white'
             )
         return fig
 
@@ -1001,11 +961,6 @@ def main():
         ('documents',     {}),
         ('current_view',  'reports'),
         ('show_settings', False),
-        ('current_document_key', None),  # Add this
-        ('current_document_content', None),  # Add this
-        ('current_document_name', None),  # Add this
-        ('current_document_id', None),  # Add this
-        ('processed_data', None),  # Add this
     ]:
         if key not in st.session_state:
             st.session_state[key] = default
@@ -1101,72 +1056,41 @@ def main():
 
         st.markdown("### 📁 Document Management")
         doc_source = st.radio("Select source:", ["📤 Upload new", "📂 Select from stored"],
-                            label_visibility="collapsed")
+                              label_visibility="collapsed")
         uploaded_file = None
 
         if doc_source == "📤 Upload new":
             uploaded_file = st.file_uploader("Choose Excel file", type=['xlsx', 'xls'],
-                                            key="file_uploader",
-                                            help="Upload a monthly uptime report")
+                                             key="file_uploader",
+                                             help="Upload a monthly uptime report")
             if uploaded_file:
-                # Check if file already exists in session
-                file_content = uploaded_file.getvalue()
-                file_hash = hashlib.sha256(file_content).hexdigest()
+                # Process file to get record count
+                try:
+                    temp_df = pd.read_excel(BytesIO(uploaded_file.getvalue()), header=None)
+                    processed_temp = data_processor.process_uptime_data(temp_df)
+                    record_count = len(processed_temp) if not processed_temp.empty else 0
+                except:
+                    record_count = 0
                 
-                # Check for duplicate in session state
-                duplicate_found = False
-                for key, doc_info in st.session_state.documents.items():
-                    if hashlib.sha256(doc_info.content).hexdigest() == file_hash:
-                        st.warning(f"⚠️ Document '{uploaded_file.name}' has already been uploaded!")
-                        duplicate_found = True
-                        # Set as current document
-                        st.session_state.current_document_key = key
-                        st.session_state.current_document_content = doc_info.content
-                        st.session_state.current_document_name = doc_info.name
-                        st.session_state.processed_data = None
-                        break
-                
-                if not duplicate_found:
-                    # Process file to get record count
-                    try:
-                        temp_df = pd.read_excel(BytesIO(file_content), header=None)
-                        processed_temp = data_processor.process_uptime_data(temp_df)
-                        record_count = len(processed_temp) if not processed_temp.empty else 0
-                    except Exception as e:
-                        st.error(f"Error processing file: {e}")
-                        record_count = 0
-                    
-                    # Save to database
-                    doc_id = db_manager.save_document(
-                        filename=uploaded_file.name,
-                        content=file_content,
+                # Save to database
+                if db_manager.save_document(
+                    filename=uploaded_file.name,
+                    content=uploaded_file.getvalue(),
+                    uploaded_by=st.session_state.username,
+                    record_count=record_count
+                ):
+                    doc_key = f"{uploaded_file.name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                    st.session_state.documents[doc_key] = DocumentInfo(
+                        name=uploaded_file.name,
+                        content=uploaded_file.getvalue(),
+                        upload_date=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                         uploaded_by=st.session_state.username,
+                        file_size=len(uploaded_file.getvalue()),
                         record_count=record_count
                     )
-                    
-                    if doc_id:
-                        doc_key = f"{uploaded_file.name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-                        st.session_state.documents[doc_key] = DocumentInfo(
-                            name=uploaded_file.name,
-                            content=file_content,
-                            upload_date=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                            uploaded_by=st.session_state.username,
-                            file_size=len(file_content),
-                            record_count=record_count,
-                            document_id=doc_id
-                        )
-                        
-                        # Set as current document
-                        st.session_state.current_document_key = doc_key
-                        st.session_state.current_document_content = file_content
-                        st.session_state.current_document_name = uploaded_file.name
-                        st.session_state.current_document_id = doc_id
-                        st.session_state.processed_data = None
-                        
-                        st.success("✅ Document saved to database")
-                        st.rerun()
-                    else:
-                        st.error("❌ Failed to save document to database")
+                    st.success("✅ Document saved to database")
+                else:
+                    st.error("❌ Failed to save document to database")
 
         else:  # "📂 Select from stored"
             # Load documents from database
@@ -1180,18 +1104,9 @@ def main():
                     display_name = f"{doc['filename']} (Uploaded: {upload_date_str})"
                     doc_options[display_name] = doc
                 
-                # Set default selection to current document if exists
-                default_index = 0
-                if st.session_state.current_document_name:
-                    for i, display_name in enumerate(doc_options.keys()):
-                        if st.session_state.current_document_name in display_name:
-                            default_index = i
-                            break
-                
                 selected_doc_name = st.selectbox(
                     "Select document:",
                     options=list(doc_options.keys()),
-                    index=default_index,
                     label_visibility="collapsed"
                 )
                 
@@ -1202,37 +1117,18 @@ def main():
                     found = False
                     for doc_key, doc_info in st.session_state.documents.items():
                         if doc_info.name == selected_doc['filename']:
-                            # Check if this is a different document than current
-                            if st.session_state.current_document_key != doc_key:
-                                st.session_state.current_document_key = doc_key
-                                st.session_state.current_document_content = doc_info.content
-                                st.session_state.current_document_name = doc_info.name
-                                st.session_state.current_document_id = doc_info.document_id
-                                st.session_state.processed_data = None
-                                st.rerun()
+                            uploaded_file = StoredFile(doc_info.content, doc_info.name)
+                            st.info(f"📄 Loaded: {doc_info.name}")
+                            st.caption(f"Size: {doc_info.file_size/1024:.1f}KB | Uploaded: {doc_info.upload_date}")
+                            if doc_info.record_count:
+                                st.caption(f"Records: {doc_info.record_count}")
                             found = True
                             break
                     
                     if not found:
                         st.warning("Document content not found in session. Please re-upload.")
-                    
-                    # Show current document info
-                    if st.session_state.current_document_name:
-                        st.info(f"📄 Current: {st.session_state.current_document_name}")
             else:
                 st.info("No documents in database. Upload a document first.")
-
-        # Add clear document button if a document is selected
-        if st.session_state.current_document_name:
-            st.markdown("---")
-            st.markdown(f"**Current Document:** {st.session_state.current_document_name}")
-            if st.button("🗑️ Clear Current Document", use_container_width=True):
-                st.session_state.current_document_key = None
-                st.session_state.current_document_content = None
-                st.session_state.current_document_name = None
-                st.session_state.current_document_id = None
-                st.session_state.processed_data = None
-                st.rerun()
 
         st.markdown("---")
         st.caption("© 2026 SACCO Uptime Analyzer")
@@ -1322,35 +1218,23 @@ def main():
 
     # ---- Reports --------------------------------------------------------
     elif st.session_state.current_view == 'reports':
-        # Check if we have a current document
-        if st.session_state.current_document_content is not None:
+        if uploaded_file is not None:
             try:
-                # Process file if not already processed or if we need to reprocess
-                if st.session_state.processed_data is None:
-                    with st.spinner("🔄 Processing file..."):
-                        df = pd.read_excel(
-                            BytesIO(st.session_state.current_document_content),
-                            header=None
-                        )
-                        st.session_state.processed_data = data_processor.process_uptime_data(df)
-                
-                processed_df = st.session_state.processed_data
+                with st.spinner("🔄 Processing file..."):
+                    file_content = uploaded_file.getvalue() if hasattr(uploaded_file, 'getvalue') else uploaded_file
+                    df = pd.read_excel(
+                        BytesIO(file_content) if isinstance(file_content, bytes) else uploaded_file,
+                        header=None
+                    )
+                    processed_df = data_processor.process_uptime_data(df)
 
                 if processed_df.empty:
                     st.error("❌ No valid data found in file")
-                    # Clear the current document if invalid
-                    st.session_state.current_document_content = None
-                    st.session_state.current_document_name = None
-                    st.session_state.processed_data = None
-                    st.rerun()
                     return
 
                 saccos     = sorted(processed_df['BANK'].dropna().unique())
                 summary_df = data_processor.get_all_saccos_summary(processed_df)
 
-                # Show current document info
-                st.info(f"📊 Analyzing: **{st.session_state.current_document_name}**")
-                
                 st.markdown("## 📊 Dashboard Overview")
                 col1, col2, col3, col4 = st.columns(4)
                 with col1: ui.metric_card("Total SACCOs",       str(len(saccos)),                                         icon="🏦")
@@ -1373,7 +1257,13 @@ def main():
                         display_summary_df['Avg Sigma'] = display_summary_df['Avg Sigma'].apply(
                             lambda x: f"{x:.2f}" if pd.notna(x) else ""
                         )
-                    
+                    cols_to_style = ['Approval Rate (%)', 'Avg Sigma']
+
+                    for col in cols_to_style:
+                        if col in display_summary_df.columns:
+                            display_summary_df[col] = (
+                                pd.to_numeric(display_summary_df[col], errors='coerce')
+                            )
                     st.dataframe(
                         display_summary_df.style.background_gradient(
                             subset=['Approval Rate (%)', 'Avg Sigma'], cmap='RdYlGn'),
@@ -1398,9 +1288,7 @@ def main():
                 with col1:
                     selected_sacco = st.selectbox("Select SACCO to analyze:", saccos, key="sacco_selector")
                 with col2:
-                    if st.button("🔄 Refresh Data", use_container_width=True):
-                        st.session_state.processed_data = None  # Clear cache to reprocess
-                        st.rerun()
+                    if st.button("📊 Refresh", use_container_width=True): st.rerun()
 
                 result = data_processor.generate_sacco_report(processed_df, selected_sacco)
                 if result:
@@ -1470,7 +1358,7 @@ def main():
                         return [''] * len(row)
 
                     st.dataframe(display_df.style.apply(highlight_total, axis=1),
-                                use_container_width=True, hide_index=True)
+                                 use_container_width=True, hide_index=True)
 
                     st.markdown("### ⬇️ Export Options")
                     col1, col2, col3 = st.columns(3)
@@ -1479,14 +1367,14 @@ def main():
                         if 'TRX_DATE' in csv_data.columns:
                             csv_data['TRX_DATE'] = csv_data['TRX_DATE'].dt.strftime('%d-%b-%Y')
                         st.download_button("📥 Download CSV", csv_data.to_csv(index=False),
-                                        f"{selected_sacco.replace(' ','_')}_report.csv", "text/csv",
-                                        use_container_width=True)
+                                           f"{selected_sacco.replace(' ','_')}_report.csv", "text/csv",
+                                           use_container_width=True)
                     with col2:
                         excel_file = excel_generator.create_report(sacco_data, summary, selected_sacco)
                         st.download_button("📥 Download Excel", excel_file,
-                                        f"{selected_sacco.replace(' ','_')}_report.xlsx",
-                                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                        use_container_width=True)
+                                           f"{selected_sacco.replace(' ','_')}_report.xlsx",
+                                           "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                           use_container_width=True)
                     with col3:
                         if st.button("📑 Generate All Report", use_container_width=True):
                             with st.spinner("Generating comprehensive report..."):
@@ -1514,22 +1402,18 @@ def main():
                                             writer, sheet_name='All_SACCOs_Summary', index=False)
                                 output.seek(0)
                                 st.download_button("📥 Download Complete Report", output,
-                                                "all_saccos_complete_report.xlsx",
-                                                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                                                   "all_saccos_complete_report.xlsx",
+                                                   "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
             except Exception as e:
                 st.error(f"❌ Error: {str(e)}")
                 st.exception(e)
-                # Clear problematic document
-                st.session_state.current_document_content = None
-                st.session_state.current_document_name = None
-                st.session_state.processed_data = None
         else:
             st.markdown("""
             <div style="text-align:center;padding:3rem;background:#f8f9fa;border-radius:10px">
                 <h2 style="color:#0B5D3B">👋 Welcome to SACCO Uptime Report Generator</h2>
-                <p style="color:#666;font-size:1.2rem">Please select a document from the sidebar to begin analysis</p>
-                <p style="color:#999">Use the Document Management section in the sidebar to upload or select a file</p>
+                <p style="color:#666;font-size:1.2rem">Please upload a file or select from stored documents to begin</p>
+                <p style="color:#999">Supported format: Excel files (.xlsx, .xls)</p>
             </div>
             """, unsafe_allow_html=True)
 
