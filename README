@@ -1,0 +1,27 @@
+ℹ️ About This System
+SACCO Uptime Report Generator — Professional Edition
+A comprehensive tool for analyzing and monitoring SACCO transaction uptime reports.
+
+Key Features:
+
+🔐 Secure authentication system
+📊 Real-time data processing and analysis
+📈 Interactive visualizations
+📑 Professional Excel report generation
+💾 Document management system with database persistence
+👥 Multi-user support with role-based access
+Version: 2.0.0
+
+Technologies: Streamlit · MySQL · Plotly · Pandas · OpenPyXL
+
+0
+📋 System Requirements
+Python 3.8+ · MySQL Server 5.7+ · Modern web browser
+🔧 Configuration — .env
+DB_HOST=localhost
+DB_USER=your_user
+DB_PASSWORD=your_password
+DB_NAME=sacco_uptime
+
+📞 Support
+Contact the system administrator for technical support or feature requests.
