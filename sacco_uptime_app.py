@@ -1359,31 +1359,65 @@ def main():
                 with col4: ui.metric_card("Avg Sigma",           f"{summary_df['Avg Sigma'].mean():.2f}",                 icon="⚡")
 
                 with st.expander("📈 View All SACCOs Performance", expanded=False):
-                    # Create a copy of the dataframe for display
-                    display_summary_df = summary_df.copy()
+                    # Calculate true approval rate including customer related as approved
+                    true_summary_data = []
                     
-                    # Format Approval Rate to 2 decimal places
-                    if 'Approval Rate (%)' in display_summary_df.columns:
-                        display_summary_df['Approval Rate (%)'] = display_summary_df['Approval Rate (%)'].apply(
-                            lambda x: f"{x:.2f}" if pd.notna(x) else ""
-                        )
+                    for sacco in saccos:
+                        sacco_df = processed_df[processed_df['BANK'].astype(str).str.contains(sacco, case=False, na=False)]
+                        
+                        # Calculate metrics with customer related included in approved
+                        approved = sacco_df['APPROVED'].sum() if 'APPROVED' in sacco_df.columns else 0
+                        customer_related = sacco_df['CUSTOMER RELATED'].sum() if 'CUSTOMER RELATED' in sacco_df.columns else 0
+                        timeout = sacco_df['TIME OUT ERROR 911'].sum() if 'TIME OUT ERROR 911' in sacco_df.columns else 0
+                        unreachable = sacco_df['UNREACHABLE 912'].sum() if 'UNREACHABLE 912' in sacco_df.columns else 0
+                        system_error = sacco_df['BANK SYSTEM_ERROR 909'].sum() if 'BANK SYSTEM_ERROR 909' in sacco_df.columns else 0
+                        
+                        # True successful transactions = Approved + Customer Related
+                        successful = approved + customer_related
+                        total_transactions = successful + timeout + unreachable + system_error
+                        
+                        # Calculate true success rate
+                        true_success_rate = (successful / total_transactions * 100) if total_transactions > 0 else 0
+                        
+                        true_summary_data.append({
+                            'SACCO': sacco,
+                            'Total Transactions': f"{total_transactions:,.0f}",
+                            'Approved': f"{approved:,.0f}",
+                            'Customer Related': f"{customer_related:,.0f}",
+                            'Errors': f"{(timeout + unreachable + system_error):,.0f}",
+                            'True Success Rate (%)': round(true_success_rate, 2),
+                            'Avg Sigma': round(sacco_df['SIGMA'].mean(), 2) if 'SIGMA' in sacco_df.columns else 0,
+                        })
                     
-                    # Format Avg Sigma to 2 decimal places
-                    if 'Avg Sigma' in display_summary_df.columns:
-                        display_summary_df['Avg Sigma'] = display_summary_df['Avg Sigma'].apply(
-                            lambda x: f"{x:.2f}" if pd.notna(x) else ""
-                        )
+                    # Create display dataframe
+                    true_summary_df = pd.DataFrame(true_summary_data)
+                    true_summary_df = true_summary_df.sort_values('True Success Rate (%)', ascending=False)
+                    
+                    # Add Rank column
+                    true_summary_df.insert(0, 'Rank', range(1, len(true_summary_df) + 1))
+                    
+                    # Create a styled copy for display
+                    display_df = true_summary_df.copy()
+                    
+                    # Format numeric columns for display
+                    for col in ['True Success Rate (%)', 'Avg Sigma']:
+                        if col in display_df.columns:
+                            display_df[col] = display_df[col].apply(lambda x: f"{x:.2f}" if pd.notna(x) else "")
                     
                     st.dataframe(
-                        display_summary_df.style.background_gradient(
-                            subset=['Approval Rate (%)', 'Avg Sigma'], cmap='RdYlGn'),
-                        use_container_width=True, hide_index=True
+                        display_df.style.background_gradient(
+                            subset=['True Success Rate (%)', 'Avg Sigma'], 
+                            cmap='RdYlGn'
+                        ),
+                        use_container_width=True, 
+                        hide_index=True
                     )
                     
+                    # Download button using the original numeric dataframe
                     st.download_button(
                         label="📥 Download Summary CSV",
-                        data=summary_df.to_csv(index=False),
-                        file_name="sacco_summary.csv",
+                        data=true_summary_df.to_csv(index=False),
+                        file_name="sacco_true_performance_summary.csv",
                         mime="text/csv"
                     )
 
